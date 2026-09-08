@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+// fifoFederationProofSyncLog is implemented by federation stores that can
+// return pending pushes in their durable insertion order.
+type fifoFederationProofSyncLog interface {
+	FetchPendingProofsSyncLogFIFO(context.Context,
+		*SyncDirection) ([]*ProofSyncLogEntry, error)
+}
+
 // signalPusher wakes the federation pusher without coupling callers to the
 // pusher's current progress. The durable proof sync log is the work queue, so
 // this channel only needs to carry an edge-triggered wakeup.
@@ -45,6 +52,24 @@ func (f *FederationEnvoy) pusher() {
 	}
 }
 
+// pendingProofPushes fetches pending work in durable FIFO order when the
+// backing store supports it. Alternate FederationDB implementations retain the
+// existing method contract, which is useful for lightweight test stores.
+func (f *FederationEnvoy) pendingProofPushes(ctx context.Context,
+	syncDirection *SyncDirection) ([]*ProofSyncLogEntry, error) {
+
+	fifoLog, ok := f.cfg.FederationDB.(fifoFederationProofSyncLog)
+	if ok {
+		return fifoLog.FetchPendingProofsSyncLogFIFO(
+			ctx, syncDirection,
+		)
+	}
+
+	return f.cfg.FederationDB.FetchPendingProofsSyncLog(
+		ctx, syncDirection,
+	)
+}
+
 // handlePendingProofPushes drains the durable push log in FIFO order. We stop
 // on the first failed push so a later reissuance cannot overtake an earlier
 // anchor proof for the same remote federation member.
@@ -53,9 +78,7 @@ func (f *FederationEnvoy) handlePendingProofPushes() error {
 	defer cancel()
 
 	syncDirection := SyncDirectionPush
-	logEntries, err := f.cfg.FederationDB.FetchPendingProofsSyncLog(
-		ctx, &syncDirection,
-	)
+	logEntries, err := f.pendingProofPushes(ctx, &syncDirection)
 	if err != nil {
 		return fmt.Errorf("unable to query pending push sync log: %w",
 			err)
