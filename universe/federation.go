@@ -135,6 +135,10 @@ type FederationEnvoy struct {
 	// out batch proof leaves to the federation.
 	batchPushRequests chan *FederationProofBatchPushReq
 
+	// pushWake wakes the dedicated federation pusher. Durable work lives in
+	// the federation proof sync log, so the channel only carries a wakeup.
+	pushWake chan struct{}
+
 	// lastEnumSync tracks, per server host, when a full enumeration
 	// sync last completed (or when the server was first seen), driving
 	// the periodic enumeration audit.
@@ -154,6 +158,7 @@ func NewFederationEnvoy(cfg FederationConfig) *FederationEnvoy {
 		cfg:               cfg,
 		pushRequests:      make(chan *FederationPushReq),
 		batchPushRequests: make(chan *FederationProofBatchPushReq),
+		pushWake:          make(chan struct{}, 1),
 		lastEnumSync:      make(map[string]time.Time),
 		ContextGuard: &fn.ContextGuard{
 			DefaultTimeout: DefaultTimeout,
@@ -192,9 +197,13 @@ func (f *FederationEnvoy) Start() error {
 				"servers: %v", err)
 		}
 
-		f.Wg.Add(1)
+		f.Wg.Add(2)
 
 		go f.syncer()
+		go f.pusher()
+
+		// Replay any durable pending pushes left by a previous run.
+		f.signalPusher()
 	})
 
 	return nil
@@ -581,9 +590,8 @@ func (f *FederationEnvoy) filterProofSyncPending(fedServers []ServerAddr,
 	return filteredFedServers, nil
 }
 
-// syncer is the main goroutine that's responsible for interacting with the
-// federation envoy. It also accepts incoming requests to push out new updates
-// to the federation.
+// syncer is the main goroutine that's responsible for periodic federation
+// synchronization. Remote proof pushes run in the dedicated pusher goroutine.
 //
 // NOTE: This function MUST be run as a goroutine.
 func (f *FederationEnvoy) syncer() {
@@ -606,30 +614,6 @@ func (f *FederationEnvoy) syncer() {
 				// more events.
 				log.Warnf("Unable to handle tick event: %v",
 					err)
-			}
-
-		// Handle a new push request.
-		case pushReq := <-f.pushRequests:
-			log.Debug("Federation envoy handling push request")
-			err := f.handlePushRequest(pushReq)
-			if err != nil {
-				// Warn, but don't exit the syncer. The syncer
-				// should continue to run and attempt handle
-				// more events.
-				log.Warnf("Unable to handle push request: %v",
-					err)
-			}
-
-		// Handle a new batch push request.
-		case pushReq := <-f.batchPushRequests:
-			log.Debug("Federation envoy handling batch push " +
-				"request")
-			err := f.handleBatchPushRequest(pushReq)
-			if err != nil {
-				// Warn, but don't exit the event handler
-				// routine.
-				log.Warnf("Unable to handle batch push "+
-					"request: %v", err)
 			}
 
 		case <-f.Quit:
@@ -656,60 +640,9 @@ func (f *FederationEnvoy) handleTickEvent() error {
 			err)
 	}
 
-	// After we've synced with the federation, we'll attempt to push out any
-	// pending proofs that we haven't yet completed.
-	ctx, cancel := f.WithCtxQuitNoTimeout()
-	defer cancel()
-
-	syncDirection := SyncDirectionPush
-	db := f.cfg.FederationDB
-
-	logEntries, err := db.FetchPendingProofsSyncLog(
-		ctx, &syncDirection,
-	)
-	if err != nil {
-		return fmt.Errorf("unable to query pending push sync log: %w",
-			err)
-	}
-
-	if len(logEntries) > 0 {
-		log.Debugf("Handling pending proof sync log entries "+
-			"(entries_count=%d)", len(logEntries))
-	}
-
-	// TODO(ffranr): Take account of any new servers that have been added
-	//  since the last time we populated the log for a given proof leaf.
-	//  Pending proof sync log entries are only relevant for the set of
-	//  servers that existed at the time the log entry was created. If a new
-	//  server is added, then we should create a new log entry for the new
-	//  server.
-
-	// We'll use a timeout that's slightly less than the sync interval to
-	// help avoid ticking into a new sync event before the previous event
-	// has finished.
-	syncContextTimeout := f.cfg.SyncInterval - 1*time.Second
-	if syncContextTimeout < 0 {
-		// If the sync interval is less than a second, then we'll use
-		// the sync interval as the timeout.
-		syncContextTimeout = f.cfg.SyncInterval
-	}
-
-	for idx := range logEntries {
-		entry := logEntries[idx]
-
-		servers := []ServerAddr{
-			entry.ServerAddr,
-		}
-
-		ctxPush, cancelPush := f.CtxBlockingCustomTimeout(
-			syncContextTimeout,
-		)
-		f.pushProofToFederation(
-			ctxPush, entry.UniID, entry.LeafKey, &entry.Leaf,
-			servers, true,
-		)
-		cancelPush()
-	}
+	// Pending federation pushes are retried by the dedicated pusher rather
+	// than on this serial sync loop.
+	f.signalPusher()
 
 	return nil
 }
@@ -867,28 +800,46 @@ func (f *FederationEnvoy) handleBatchPushRequest(
 // ultimately queuing it to also be sent to the set of active universe servers.
 //
 // NOTE: This is part of the universe.Registrar interface.
-func (f *FederationEnvoy) UpsertProofLeaf(_ context.Context, id Identifier,
+func (f *FederationEnvoy) UpsertProofLeaf(ctx context.Context, id Identifier,
 	key LeafKey, leaf *Leaf) (*Proof, error) {
 
-	// If we're attempting to push an issuance proof, then we'll ensure
-	// that we track the sync attempt to ensure that we retry in the event
-	// of a failure.
-	logProofSync := id.ProofType == ProofTypeIssuance
+	newProof, err := f.cfg.LocalRegistrar.UpsertProofLeaf(
+		ctx, id, key, leaf,
+	)
+	var pendingErr error
+	switch {
+	case errors.Is(err, ErrMultiversePending):
+		pendingErr = err
+		log.Warnf("Proof stored with multiverse update pending, "+
+			"proceeding with federation push (id=%v): %v",
+			id.StringForLog(), err)
 
-	pushReq := &FederationPushReq{
+	case err != nil:
+		return nil, fmt.Errorf("unable to insert proof into local "+
+			"universe: %w", err)
+	}
+
+	item := &Item{
 		ID:           id,
 		Key:          key,
 		Leaf:         leaf,
-		LogProofSync: logProofSync,
-		resp:         make(chan *Proof, 1),
-		err:          make(chan error, 1),
+		LogProofSync: id.ProofType == ProofTypeIssuance,
+	}
+	if err := f.queueProofPushes(ctx, []*Item{item}); err != nil {
+		if pendingErr != nil {
+			log.Warnf("Unable to queue federation push after "+
+				"multiverse-pending upsert: %v", err)
+			return nil, pendingErr
+		}
+
+		return nil, err
 	}
 
-	if !fn.SendOrQuit(f.pushRequests, pushReq, f.Quit) {
-		return nil, fmt.Errorf("unable to push new proof event")
+	if pendingErr != nil {
+		return nil, pendingErr
 	}
 
-	return fn.RecvResp(pushReq.resp, pushReq.err, f.Quit)
+	return newProof, nil
 }
 
 // UpsertProofLeafBatch inserts a batch of proof leaves within the target
@@ -896,21 +847,34 @@ func (f *FederationEnvoy) UpsertProofLeaf(_ context.Context, id Identifier,
 // checked that they don't yet exist in the local database.
 //
 // NOTE: This is part of the universe.BatchRegistrar interface.
-func (f *FederationEnvoy) UpsertProofLeafBatch(_ context.Context,
+func (f *FederationEnvoy) UpsertProofLeafBatch(ctx context.Context,
 	items []*Item) error {
 
-	pushReq := &FederationProofBatchPushReq{
-		Batch: items,
-		resp:  make(chan struct{}, 1),
-		err:   make(chan error, 1),
+	err := f.cfg.LocalRegistrar.UpsertProofLeafBatch(ctx, items)
+	var pendingErr error
+	switch {
+	case errors.Is(err, ErrMultiversePending):
+		pendingErr = err
+		log.Warnf("Proof batch stored with multiverse updates "+
+			"pending, proceeding with federation push "+
+			"(num_leaves=%d): %v", len(items), err)
+
+	case err != nil:
+		return fmt.Errorf("unable to insert proof batch into local "+
+			"universe: %w", err)
 	}
 
-	if !fn.SendOrQuit(f.batchPushRequests, pushReq, f.Quit) {
-		return fmt.Errorf("unable to push new proof event batch")
+	if err := f.queueProofPushes(ctx, items); err != nil {
+		if pendingErr != nil {
+			log.Warnf("Unable to queue federation push after "+
+				"multiverse-pending batch upsert: %v", err)
+			return pendingErr
+		}
+
+		return err
 	}
 
-	_, err := fn.RecvResp(pushReq.resp, pushReq.err, f.Quit)
-	return err
+	return pendingErr
 }
 
 // AddServer adds a new set of servers to the federation, then immediately
