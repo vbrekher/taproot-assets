@@ -3266,12 +3266,22 @@ func (r *RPCServer) CommitVirtualPsbts(ctx context.Context,
 				return
 			}
 
+			// The RPC context can already be canceled when the deferred
+			// cleanup runs, so use an independent timeout for releasing
+			// the lnd leases.
+			cleanupCtx, cancel := context.WithTimeout(
+				context.Background(), 30*time.Second,
+			)
+			defer cancel()
+
 			for idx, utxo := range lockedUTXO {
 				var lockID wtxmgr.LockID
 				copy(lockID[:], utxo.Id)
 
 				op := lockedOutpoints[idx]
-				err := lndWallet.ReleaseOutput(ctx, lockID, op)
+				err := lndWallet.ReleaseOutput(
+					cleanupCtx, lockID, op,
+				)
 				if err != nil {
 					rpcsLog.Errorf("Error unlocking lnd "+
 						"UTXO %v: %v", op, err)
